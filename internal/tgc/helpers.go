@@ -9,16 +9,17 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/divyam234/teldrive/internal/config"
-	"github.com/divyam234/teldrive/internal/kv"
-	"github.com/divyam234/teldrive/pkg/types"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/tg"
+	"github.com/tgdrive/teldrive/internal/config"
+	"github.com/tgdrive/teldrive/internal/utils"
+	"github.com/tgdrive/teldrive/pkg/types"
 	"golang.org/x/sync/errgroup"
+	"gorm.io/gorm"
 )
 
 var (
-	ErrInValidChannelID       = errors.New("invalid channel id")
+	ErrInValidChannelId       = errors.New("invalid channel id")
 	ErrInvalidChannelMessages = errors.New("invalid channel messages")
 )
 
@@ -27,13 +28,12 @@ func GetChannelById(ctx context.Context, client *tg.Client, channelId int64) (*t
 		ChannelID: channelId,
 	}
 	channels, err := client.ChannelsGetChannels(ctx, []tg.InputChannelClass{inputChannel})
-
 	if err != nil {
 		return nil, err
 	}
 
 	if len(channels.GetChats()) == 0 {
-		return nil, ErrInValidChannelID
+		return nil, ErrInValidChannelId
 	}
 	return channels.GetChats()[0].(*tg.Channel).AsInput(), nil
 }
@@ -71,15 +71,11 @@ func DeleteMessages(ctx context.Context, client *telegram.Client, channelId int6
 
 func getTGMessagesBatch(ctx context.Context, client *tg.Client, channel *tg.InputChannel, ids []int) (tg.MessagesMessagesClass, error) {
 
-	msgIds := []tg.InputMessageClass{}
-
-	for _, id := range ids {
-		msgIds = append(msgIds, &tg.InputMessageID{ID: id})
-	}
-
 	messageRequest := tg.ChannelsGetMessagesRequest{
 		Channel: channel,
-		ID:      msgIds,
+		ID: utils.Map(ids, func(id int) tg.InputMessageClass {
+			return &tg.InputMessageID{ID: id}
+		}),
 	}
 
 	res, err := client.ChannelsGetMessages(ctx, &messageRequest)
@@ -100,7 +96,7 @@ func GetMessages(ctx context.Context, client *tg.Client, ids []int, channelId in
 		return nil, err
 	}
 
-	batchSize := 200
+	batchSize := 100
 
 	batchCount := int(math.Ceil(float64(len(ids)) / float64(batchSize)))
 
@@ -184,9 +180,10 @@ func GetMediaContent(ctx context.Context, client *tg.Client, location tg.InputFi
 	return buff, nil
 }
 
-func GetBotInfo(ctx context.Context, KV kv.KV, config *config.TGConfig, token string) (*types.BotInfo, error) {
+func GetBotInfo(ctx context.Context, db *gorm.DB, config *config.TGConfig, token string) (*types.BotInfo, error) {
 	var user *tg.User
-	client, _ := BotClient(ctx, KV, config, token, Middlewares(config, 5)...)
+	middlewares := NewMiddleware(config, WithFloodWait(), WithRateLimit())
+	client, _ := BotClient(ctx, db, config, token, middlewares...)
 	err := RunWithAuth(ctx, client, token, func(ctx context.Context) error {
 		user, _ = client.Self(ctx)
 		return nil

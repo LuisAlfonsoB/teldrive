@@ -2,27 +2,31 @@ package tgc
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
-	"github.com/divyam234/teldrive/internal/config"
-	"github.com/divyam234/teldrive/internal/kv"
-	"github.com/divyam234/teldrive/internal/logging"
-	"github.com/divyam234/teldrive/internal/recovery"
-	"github.com/divyam234/teldrive/internal/retry"
-	"github.com/divyam234/teldrive/internal/utils"
+	"github.com/go-faster/errors"
+	"github.com/gotd/contrib/clock"
 	"github.com/gotd/contrib/middleware/floodwait"
 	"github.com/gotd/contrib/middleware/ratelimit"
 	"github.com/gotd/td/session"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/dcs"
-	"github.com/pkg/errors"
+	"github.com/tgdrive/teldrive/internal/cache"
+	"github.com/tgdrive/teldrive/internal/config"
+	"github.com/tgdrive/teldrive/internal/logging"
+	"github.com/tgdrive/teldrive/internal/recovery"
+	"github.com/tgdrive/teldrive/internal/retry"
+	"github.com/tgdrive/teldrive/internal/tgstorage"
+	"github.com/tgdrive/teldrive/internal/utils"
 	"go.uber.org/zap"
 	"golang.org/x/net/proxy"
 	"golang.org/x/time/rate"
+	"gorm.io/gorm"
 )
 
-func New(ctx context.Context, config *config.TGConfig, handler telegram.UpdateHandler, storage session.Storage, middlewares ...telegram.Middleware) (*telegram.Client, error) {
+func newClient(ctx context.Context, config *config.TGConfig, handler telegram.UpdateHandler, storage session.Storage, middlewares ...telegram.Middleware) (*telegram.Client, error) {
 
 	var dialer dcs.DialFunc = proxy.Direct.DialContext
 	if config.Proxy != "" {
@@ -35,7 +39,7 @@ func New(ctx context.Context, config *config.TGConfig, handler telegram.UpdateHa
 
 	var logger *zap.Logger
 	if config.EnableLogging {
-		logger = logging.FromContext(ctx).Desugar().Named("td")
+		logger = logging.FromContext(ctx).Named("td")
 
 	}
 
@@ -62,6 +66,14 @@ func New(ctx context.Context, config *config.TGConfig, handler telegram.UpdateHa
 		UpdateHandler:  handler,
 		Logger:         logger,
 	}
+	if config.Ntp {
+		c, err := clock.NewNTP()
+		if err != nil {
+			return nil, errors.Wrap(err, "create clock")
+		}
+		opts.Clock = c
+
+	}
 
 	return telegram.NewClient(config.AppId, config.AppHash, opts), nil
 }
@@ -71,7 +83,7 @@ func NoAuthClient(ctx context.Context, config *config.TGConfig, handler telegram
 		floodwait.NewSimpleWaiter(),
 	}
 	middlewares = append(middlewares, ratelimit.New(rate.Every(time.Millisecond*100), 5))
-	return New(ctx, config, handler, storage, middlewares...)
+	return newClient(ctx, config, handler, storage, middlewares...)
 }
 
 func AuthClient(ctx context.Context, config *config.TGConfig, sessionStr string, middlewares ...telegram.Middleware) (*telegram.Client, error) {
@@ -89,28 +101,61 @@ func AuthClient(ctx context.Context, config *config.TGConfig, sessionStr string,
 	if err := loader.Save(context.TODO(), data); err != nil {
 		return nil, err
 	}
-	return New(ctx, config, nil, storage, middlewares...)
+	return newClient(ctx, config, nil, storage, middlewares...)
 }
 
-func BotClient(ctx context.Context, KV kv.KV, config *config.TGConfig, token string, middlewares ...telegram.Middleware) (*telegram.Client, error) {
+func BotClient(ctx context.Context, db *gorm.DB, config *config.TGConfig, token string, middlewares ...telegram.Middleware) (*telegram.Client, error) {
 
-	storage := kv.NewSession(KV, kv.Key("botsession", token))
+	storage := tgstorage.NewSessionStorage(db, cache.Key("sessions", strings.Split(token, ":")[0]))
 
-	return New(ctx, config, nil, storage, middlewares...)
+	return newClient(ctx, config, nil, storage, middlewares...)
 
 }
 
-func Middlewares(config *config.TGConfig, retries int) []telegram.Middleware {
-	middlewares := []telegram.Middleware{
-		floodwait.NewSimpleWaiter(),
-		recovery.New(context.Background(), newBackoff(config.ReconnectTimeout)),
-		retry.New(retries),
-	}
-	if config.RateLimit {
-		middlewares = append(middlewares, ratelimit.New(rate.Every(time.Millisecond*time.Duration(config.Rate)), config.RateBurst))
-	}
-	return middlewares
+type middlewareOption func(*middlewareConfig)
 
+type middlewareConfig struct {
+	config      *config.TGConfig
+	middlewares []telegram.Middleware
+}
+
+func NewMiddleware(config *config.TGConfig, opts ...middlewareOption) []telegram.Middleware {
+	mc := &middlewareConfig{
+		config:      config,
+		middlewares: []telegram.Middleware{},
+	}
+	for _, opt := range opts {
+		opt(mc)
+	}
+	return mc.middlewares
+}
+
+func WithFloodWait() middlewareOption {
+	return func(mc *middlewareConfig) {
+		mc.middlewares = append(mc.middlewares, floodwait.NewSimpleWaiter())
+	}
+}
+
+func WithRecovery(ctx context.Context) middlewareOption {
+	return func(mc *middlewareConfig) {
+		mc.middlewares = append(mc.middlewares,
+			recovery.New(ctx, newBackoff(mc.config.ReconnectTimeout)))
+	}
+}
+
+func WithRetry(retries int) middlewareOption {
+	return func(mc *middlewareConfig) {
+		mc.middlewares = append(mc.middlewares, retry.New(retries))
+	}
+}
+
+func WithRateLimit() middlewareOption {
+	return func(mc *middlewareConfig) {
+		if mc.config.RateLimit {
+			mc.middlewares = append(mc.middlewares,
+				ratelimit.New(rate.Every(time.Millisecond*time.Duration(mc.config.Rate)), mc.config.RateBurst))
+		}
+	}
 }
 
 func newBackoff(timeout time.Duration) backoff.BackOff {

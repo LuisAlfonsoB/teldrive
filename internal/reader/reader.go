@@ -2,15 +2,14 @@ package reader
 
 import (
 	"context"
-	"fmt"
 	"io"
 
-	"github.com/divyam234/teldrive/internal/cache"
-	"github.com/divyam234/teldrive/internal/config"
-	"github.com/divyam234/teldrive/internal/tgc"
-	"github.com/divyam234/teldrive/pkg/schemas"
-	"github.com/divyam234/teldrive/pkg/types"
 	"github.com/gotd/td/tg"
+	"github.com/tgdrive/teldrive/internal/cache"
+	"github.com/tgdrive/teldrive/internal/config"
+	"github.com/tgdrive/teldrive/internal/crypt"
+	"github.com/tgdrive/teldrive/pkg/models"
+	"github.com/tgdrive/teldrive/pkg/types"
 )
 
 type Range struct {
@@ -20,14 +19,13 @@ type Range struct {
 
 type LinearReader struct {
 	ctx         context.Context
-	file        *schemas.FileOutFull
+	file        *models.File
 	parts       []types.Part
 	ranges      []Range
 	pos         int
 	reader      io.ReadCloser
 	remaining   int64
 	config      *config.TGConfig
-	worker      *tgc.StreamWorker
 	client      *tg.Client
 	concurrency int
 	cache       cache.Cacher
@@ -52,9 +50,8 @@ func calculatePartByteRanges(start, end, partSize int64) []Range {
 
 func NewLinearReader(ctx context.Context,
 	client *tg.Client,
-	worker *tgc.StreamWorker,
 	cache cache.Cacher,
-	file *schemas.FileOutFull,
+	file *models.File,
 	parts []types.Part,
 	start,
 	end int64,
@@ -62,15 +59,18 @@ func NewLinearReader(ctx context.Context,
 	concurrency int,
 ) (io.ReadCloser, error) {
 
+	size := parts[0].Size
+	if file.Encrypted {
+		size = parts[0].DecryptedSize
+	}
 	r := &LinearReader{
 		ctx:         ctx,
 		parts:       parts,
 		file:        file,
 		remaining:   end - start + 1,
-		ranges:      calculatePartByteRanges(start, end, parts[0].Size),
+		ranges:      calculatePartByteRanges(start, end, size),
 		config:      config,
 		client:      client,
-		worker:      worker,
 		concurrency: concurrency,
 		cache:       cache,
 	}
@@ -128,20 +128,49 @@ func (r *LinearReader) moveToNextPart() error {
 
 func (r *LinearReader) getPartReader() (io.ReadCloser, error) {
 	currentRange := r.ranges[r.pos]
-	partID := r.parts[currentRange.PartNo].ID
+	partId := r.parts[currentRange.PartNo].ID
 
 	chunkSrc := &chunkSource{
-		channelID:   r.file.ChannelID,
-		partID:      partID,
+		channelId:   *r.file.ChannelId,
+		partId:      partId,
 		client:      r.client,
 		concurrency: r.concurrency,
 		cache:       r.cache,
-		key:         fmt.Sprintf("files:location:%s:%d", r.file.Id, partID),
-		worker:      r.worker,
+		key:         cache.Key("files", "location", r.file.ID, partId),
 	}
 
-	if r.concurrency < 2 {
-		return newTGReader(r.ctx, currentRange.Start, currentRange.End, chunkSrc)
+	var (
+		reader io.ReadCloser
+		err    error
+	)
+	if r.file.Encrypted {
+		salt := r.parts[r.ranges[r.pos].PartNo].Salt
+		cipher, _ := crypt.NewCipher(r.config.Uploads.EncryptionKey, salt)
+		reader, err = cipher.DecryptDataSeek(r.ctx,
+			func(ctx context.Context,
+				underlyingOffset,
+				underlyingLimit int64) (io.ReadCloser, error) {
+				var end int64
+
+				if underlyingLimit >= 0 {
+					end = min(r.parts[r.ranges[r.pos].PartNo].Size-1, underlyingOffset+underlyingLimit-1)
+				}
+
+				if r.concurrency < 2 {
+					return newTGReader(r.ctx, underlyingOffset, end, chunkSrc)
+				}
+				return newTGMultiReader(r.ctx, underlyingOffset, end, r.config, chunkSrc)
+
+			}, currentRange.Start, currentRange.End-currentRange.Start+1)
+
+	} else {
+		if r.concurrency < 2 {
+			reader, err = newTGReader(r.ctx, currentRange.Start, currentRange.End, chunkSrc)
+		} else {
+			reader, err = newTGMultiReader(r.ctx, currentRange.Start, currentRange.End, r.config, chunkSrc)
+		}
+
 	}
-	return newTGMultiReader(r.ctx, currentRange.Start, currentRange.End, r.config, chunkSrc)
+	return reader, err
+
 }

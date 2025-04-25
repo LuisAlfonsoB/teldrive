@@ -7,10 +7,10 @@ import (
 	"io"
 	"time"
 
-	"github.com/divyam234/teldrive/internal/cache"
-	"github.com/divyam234/teldrive/internal/config"
-	"github.com/divyam234/teldrive/internal/tgc"
 	"github.com/gotd/td/tg"
+	"github.com/tgdrive/teldrive/internal/cache"
+	"github.com/tgdrive/teldrive/internal/config"
+	"github.com/tgdrive/teldrive/internal/tgc"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -25,13 +25,12 @@ type ChunkSource interface {
 }
 
 type chunkSource struct {
-	channelID   int64
-	partID      int64
+	channelId   int64
+	partId      int64
 	concurrency int
 	client      *tg.Client
 	key         string
 	cache       cache.Cacher
-	worker      *tgc.StreamWorker
 }
 
 func (c *chunkSource) ChunkSize(start, end int64) int64 {
@@ -42,31 +41,19 @@ func (c *chunkSource) Chunk(ctx context.Context, offset int64, limit int64) ([]b
 	var (
 		location *tg.InputDocumentFileLocation
 		err      error
-		client   *tg.Client
 	)
 
 	err = c.cache.Get(c.key, location)
 
-	client = c.client
-
-	if c.concurrency > 0 {
-		tc, err := c.worker.Next(c.channelID)
-		if err != nil {
-			return nil, err
-		}
-		client = tc.Tg.API()
-
-	}
-
 	if err != nil {
-		location, err = tgc.GetLocation(ctx, client, c.channelID, c.partID)
+		location, err = tgc.GetLocation(ctx, c.client, c.channelId, c.partId)
 		if err != nil {
 			return nil, err
 		}
 		c.cache.Set(c.key, location, 30*time.Minute)
 	}
 
-	return tgc.GetChunk(ctx, client, location, offset, limit)
+	return tgc.GetChunk(ctx, c.client, location, offset, limit)
 
 }
 
@@ -114,7 +101,7 @@ func newTGMultiReader(
 		timeout:     config.Stream.ChunkTimeout,
 	}
 
-	go r.fillBufferConcurrently()
+	go r.fillBuffer()
 	return r, nil
 }
 
@@ -151,7 +138,7 @@ func (r *tgMultiReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func (r *tgMultiReader) fillBufferConcurrently() {
+func (r *tgMultiReader) fillBuffer() {
 	defer close(r.bufferChan)
 
 	for r.currentPart < r.totalParts {

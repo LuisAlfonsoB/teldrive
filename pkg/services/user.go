@@ -1,58 +1,175 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
-	"time"
 
-	"github.com/divyam234/teldrive/internal/auth"
-	"github.com/divyam234/teldrive/internal/cache"
-	"github.com/divyam234/teldrive/internal/config"
-	"github.com/divyam234/teldrive/internal/kv"
-	"github.com/divyam234/teldrive/internal/tgc"
-	"github.com/divyam234/teldrive/pkg/models"
-	"github.com/divyam234/teldrive/pkg/schemas"
-	"github.com/divyam234/teldrive/pkg/types"
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/message/peer"
 	"github.com/gotd/td/telegram/query"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
+	"github.com/tgdrive/teldrive/internal/api"
+	"github.com/tgdrive/teldrive/internal/auth"
+	"github.com/tgdrive/teldrive/internal/cache"
+	"github.com/tgdrive/teldrive/internal/tgc"
+	"github.com/tgdrive/teldrive/internal/tgstorage"
+	"github.com/tgdrive/teldrive/pkg/models"
+	"github.com/tgdrive/teldrive/pkg/types"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/gin-gonic/gin"
-	"gorm.io/gorm"
+	"github.com/gotd/contrib/storage"
 	"gorm.io/gorm/clause"
 )
 
-type UserService struct {
-	db    *gorm.DB
-	cnf   *config.Config
-	kv    kv.KV
-	cache cache.Cacher
+func (a *apiService) UsersAddBots(ctx context.Context, req *api.AddBots) error {
+	userId := auth.GetUser(ctx)
+	client, _ := tgc.AuthClient(ctx, &a.cnf.TG, auth.GetJWTUser(ctx).TgSession, a.middlewares...)
+
+	if len(req.Bots) > 0 {
+		channelId, err := getDefaultChannel(a.db, a.cache, userId)
+
+		if err != nil {
+			return &apiError{err: err}
+		}
+		err = a.addBots(ctx, client, userId, channelId, req.Bots)
+		if err != nil {
+			return &apiError{err: err}
+		}
+	}
+	return nil
+
 }
 
-func NewUserService(db *gorm.DB, cnf *config.Config, kv kv.KV, cache cache.Cacher) *UserService {
-	return &UserService{db: db, cnf: cnf, kv: kv, cache: cache}
-}
-func (us *UserService) GetProfilePhoto(c *gin.Context) {
-	_, session := auth.GetUser(c)
+func (a *apiService) UsersListChannels(ctx context.Context) ([]api.Channel, error) {
 
-	client, err := tgc.AuthClient(c, &us.cnf.TG, session)
+	userId := auth.GetUser(ctx)
 
+	channels := make(map[int64]*api.Channel)
+
+	peerStorage := tgstorage.NewPeerStorage(a.tgdb, cache.Key("peers", userId))
+
+	iter, err := peerStorage.Iterate(ctx)
 	if err != nil {
-		c.AbortWithError(http.StatusInternalServerError, err)
-		return
+		return []api.Channel{}, nil
+	}
+	defer iter.Close()
+	for iter.Next(ctx) {
+		peer := iter.Value()
+		if peer.Channel != nil && peer.Channel.AdminRights.AddAdmins {
+			_, exists := channels[peer.Channel.ID]
+			if !exists {
+				channels[peer.Channel.ID] = &api.Channel{ChannelId: peer.Channel.ID, ChannelName: peer.Channel.Title}
+			}
+		}
+
 	}
 
-	err = tgc.RunWithAuth(c, client, "", func(ctx context.Context) error {
-		self, err := client.Self(c)
+	res := []api.Channel{}
+	for _, channel := range channels {
+		res = append(res, *channel)
+
+	}
+	sort.Slice(res, func(i, j int) bool {
+		return res[i].ChannelName < res[j].ChannelName
+	})
+	return res, nil
+}
+
+func (a *apiService) UsersSyncChannels(ctx context.Context) error {
+	userId := auth.GetUser(ctx)
+	peerStorage := tgstorage.NewPeerStorage(a.tgdb, cache.Key("peers", userId))
+	collector := storage.CollectPeers(peerStorage)
+	client, err := tgc.AuthClient(ctx, &a.cnf.TG, auth.GetJWTUser(ctx).TgSession, a.middlewares...)
+	if err != nil {
+		return &apiError{err: err}
+	}
+	err = client.Run(ctx, func(ctx context.Context) error {
+		return collector.Dialogs(ctx, query.GetDialogs(client.API()).Iter())
+	})
+	if err != nil {
+		return &apiError{err: err}
+	}
+	return nil
+}
+
+func (a *apiService) UsersListSessions(ctx context.Context) ([]api.UserSession, error) {
+	userId := auth.GetUser(ctx)
+	return cache.Fetch(a.cache, cache.Key("users", "sessions", userId), 0, func() ([]api.UserSession, error) {
+
+		userSession := auth.GetJWTUser(ctx).TgSession
+
+		client, _ := tgc.AuthClient(ctx, &a.cnf.TG, userSession, a.middlewares...)
+
+		var (
+			auth *tg.AccountAuthorizations
+			err  error
+		)
+
+		err = client.Run(ctx, func(ctx context.Context) error {
+			auth, err = client.API().AccountGetAuthorizations(ctx)
+			if err != nil {
+				return err
+			}
+			return nil
+		})
+
+		if err != nil && !tgerr.Is(err, "AUTH_KEY_UNREGISTERED") {
+			return nil, err
+		}
+
+		dbSessions := []models.Session{}
+
+		if err = a.db.Where("user_id = ?", userId).Order("created_at DESC").Find(&dbSessions).Error; err != nil {
+			return nil, err
+		}
+
+		sessionsOut := []api.UserSession{}
+
+		for _, session := range dbSessions {
+
+			s := api.UserSession{Hash: session.Hash,
+				CreatedAt: session.CreatedAt.UTC(),
+				Current:   session.Session == userSession}
+
+			if auth != nil {
+				for _, a := range auth.Authorizations {
+					if session.SessionDate == a.DateCreated {
+						s.AppName = api.NewOptString(strings.Trim(strings.Replace(a.AppName, "Telegram", "", -1), " "))
+						s.Location = api.NewOptString(a.Country)
+						s.OfficialApp = api.NewOptBool(a.OfficialApp)
+						s.Valid = true
+						break
+					}
+				}
+			}
+
+			sessionsOut = append(sessionsOut, s)
+		}
+
+		return sessionsOut, nil
+
+	})
+
+}
+
+func (a *apiService) UsersProfileImage(ctx context.Context, params api.UsersProfileImageParams) (*api.UsersProfileImageOKHeaders, error) {
+
+	client, err := tgc.AuthClient(ctx, &a.cnf.TG, auth.GetJWTUser(ctx).TgSession, a.middlewares...)
+
+	if err != nil {
+		return nil, &apiError{err: err}
+	}
+
+	res := &api.UsersProfileImageOKHeaders{}
+
+	err = tgc.RunWithAuth(ctx, client, "", func(ctx context.Context) error {
+		self, err := client.Self(ctx)
 		if err != nil {
 			return err
 		}
@@ -64,231 +181,115 @@ func (us *UserService) GetProfilePhoto(c *gin.Context) {
 		if !ok {
 			return errors.New("profile not found")
 		}
+		photo.GetPersonal()
 		location := &tg.InputPeerPhotoFileLocation{Big: false, Peer: peer, PhotoID: photo.PhotoID}
-		buff, err := tgc.GetMediaContent(c, client.API(), location)
+		buff, err := tgc.GetMediaContent(ctx, client.API(), location)
 		if err != nil {
 			return err
 		}
 		content := buff.Bytes()
-		c.Writer.Header().Set("Content-Type", "image/jpeg")
-		c.Writer.Header().Set("Cache-Control", "public, max-age=86400")
-		c.Writer.Header().Set("Content-Length", strconv.Itoa(len(content)))
-		c.Writer.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", "profile.jpeg"))
-		c.Writer.Write(content)
+		res.SetCacheControl("public, max-age=86400, must-revalidate")
+		res.SetContentLength(int64(len(content)))
+		res.SetEtag(fmt.Sprintf("\"%v\"", photo.PhotoID))
+		res.SetContentDisposition(fmt.Sprintf("inline; filename=\"%s\"", "profile.jpeg"))
+		res.Response = api.UsersProfileImageOK{Data: bytes.NewReader(content)}
 		return nil
 	})
 	if err != nil {
-		c.AbortWithError(http.StatusNotFound, err)
-		return
+		return nil, &apiError{err: err}
 	}
+	return res, nil
 }
 
-func (us *UserService) GetStats(c *gin.Context) (*schemas.AccountStats, *types.AppError) {
-	userID, _ := auth.GetUser(c)
+func (a *apiService) UsersRemoveBots(ctx context.Context) error {
+	userId := auth.GetUser(ctx)
+
+	channelId, err := getDefaultChannel(a.db, a.cache, userId)
+	if err != nil {
+		return &apiError{err: err}
+	}
+
+	if err := a.db.Where("user_id = ?", userId).Where("channel_id = ?", channelId).
+		Delete(&models.Bot{}).Error; err != nil {
+		return &apiError{err: err}
+	}
+
+	a.cache.Delete(cache.Key("users", "bots", userId, channelId))
+
+	return nil
+}
+
+func (a *apiService) UsersRemoveSession(ctx context.Context, params api.UsersRemoveSessionParams) error {
+	userId := auth.GetUser(ctx)
+
+	session := &models.Session{}
+
+	if err := a.db.Where("user_id = ?", userId).Where("hash = ?", params.ID).First(session).Error; err != nil {
+		return &apiError{err: err}
+	}
+
+	client, _ := tgc.AuthClient(ctx, &a.cnf.TG, session.Session, a.middlewares...)
+
+	client.Run(ctx, func(ctx context.Context) error {
+		_, err := client.API().AuthLogOut(ctx)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+
+	a.db.Where("user_id = ?", userId).Where("hash = ?", session.Hash).Delete(&models.Session{})
+	a.cache.Delete(cache.Key("users", "sessions", userId))
+
+	return nil
+}
+
+func (a *apiService) UsersStats(ctx context.Context) (*api.UserConfig, error) {
+	userId := auth.GetUser(ctx)
 	var (
 		channelId int64
 		err       error
 	)
 
-	channelId, _ = getDefaultChannel(us.db, us.cache, userID)
+	channelId, err = getDefaultChannel(a.db, a.cache, userId)
+	if err != nil {
+		channelId = 0
+	}
 
-	tokens, err := getBotsToken(us.db, us.cache, userID, channelId)
+	tokens, err := getBotsToken(a.db, a.cache, userId, channelId)
 
 	if err != nil {
-		return nil, &types.AppError{Error: err, Code: http.StatusInternalServerError}
+		tokens = []string{}
 	}
-	return &schemas.AccountStats{Bots: tokens, ChannelID: channelId}, nil
+	return &api.UserConfig{Bots: tokens, ChannelId: channelId}, nil
 }
 
-func (us *UserService) UpdateChannel(c *gin.Context) (*schemas.Message, *types.AppError) {
+func (a *apiService) UsersUpdateChannel(ctx context.Context, req *api.ChannelUpdate) error {
+	userId := auth.GetUser(ctx)
 
-	userId, _ := auth.GetUser(c)
+	channel := &models.Channel{UserId: userId, Selected: true}
 
-	var payload schemas.Channel
-
-	if err := c.ShouldBindJSON(&payload); err != nil {
-		return nil, &types.AppError{Error: err, Code: http.StatusBadRequest}
+	if req.ChannelId.Value != 0 {
+		channel.ChannelId = req.ChannelId.Value
+	}
+	if req.ChannelName.Value != "" {
+		channel.ChannelName = req.ChannelName.Value
 	}
 
-	channel := &models.Channel{ChannelID: payload.ChannelID, ChannelName: payload.ChannelName, UserID: userId,
-		Selected: true}
-
-	if err := us.db.Clauses(clause.OnConflict{
+	if err := a.db.Clauses(clause.OnConflict{
 		Columns:   []clause.Column{{Name: "channel_id"}},
-		DoUpdates: clause.Assignments(map[string]interface{}{"selected": true}),
+		DoUpdates: clause.Assignments(map[string]any{"selected": true}),
 	}).Create(channel).Error; err != nil {
-		return nil, &types.AppError{Error: errors.New("failed to update channel"),
-			Code: http.StatusInternalServerError}
+		return &apiError{err: errors.New("failed to update channel")}
 	}
-	us.db.Model(&models.Channel{}).Where("channel_id != ?", payload.ChannelID).
+	a.db.Model(&models.Channel{}).Where("channel_id != ?", channel.ChannelId).
 		Where("user_id = ?", userId).Update("selected", false)
 
-	key := fmt.Sprintf("users:channel:%d", userId)
-	us.cache.Set(key, payload.ChannelID, 0)
-	return &schemas.Message{Message: "channel updated"}, nil
+	a.cache.Set(cache.Key("users", "channel", userId), channel.ChannelId, 0)
+	return nil
 }
 
-func (us *UserService) ListSessions(c *gin.Context) ([]schemas.SessionOut, *types.AppError) {
-	userId, userSession := auth.GetUser(c)
-
-	client, _ := tgc.AuthClient(c, &us.cnf.TG, userSession)
-
-	var (
-		auth *tg.AccountAuthorizations
-		err  error
-	)
-
-	err = client.Run(c, func(ctx context.Context) error {
-		auth, err = client.API().AccountGetAuthorizations(c)
-		if err != nil {
-			return err
-		}
-		return nil
-	})
-
-	if err != nil && !tgerr.Is(err, "AUTH_KEY_UNREGISTERED") {
-		return nil, &types.AppError{Error: err}
-	}
-
-	dbSessions := []models.Session{}
-
-	if err = us.db.Where("user_id = ?", userId).Order("created_at DESC").Find(&dbSessions).Error; err != nil {
-		return nil, &types.AppError{Error: err}
-	}
-
-	sessionsOut := []schemas.SessionOut{}
-
-	for _, session := range dbSessions {
-
-		s := schemas.SessionOut{Hash: session.Hash,
-			CreatedAt: session.CreatedAt.UTC().Format(time.RFC3339),
-			Current:   session.Session == userSession}
-
-		if auth != nil {
-			for _, a := range auth.Authorizations {
-				if session.SessionDate == a.DateCreated {
-					s.AppName = strings.Trim(strings.Replace(a.AppName, "Telegram", "", -1), " ")
-					s.Location = a.Country
-					s.OfficialApp = a.OfficialApp
-					s.Valid = true
-					break
-				}
-			}
-		}
-
-		sessionsOut = append(sessionsOut, s)
-	}
-
-	return sessionsOut, nil
-}
-
-func (us *UserService) RemoveSession(c *gin.Context) (*schemas.Message, *types.AppError) {
-
-	userId, _ := auth.GetUser(c)
-
-	session := &models.Session{}
-
-	if err := us.db.Where("user_id = ?", userId).Where("hash = ?", c.Param("id")).First(session).Error; err != nil {
-		return nil, &types.AppError{Error: err}
-	}
-
-	client, _ := tgc.AuthClient(c, &us.cnf.TG, session.Session)
-
-	client.Run(c, func(ctx context.Context) error {
-		_, err := client.API().AuthLogOut(c)
-		if err != nil {
-			return err
-		}
-		return nil
-	})
-
-	us.db.Where("user_id = ?", userId).Where("hash = ?", session.Hash).Delete(&models.Session{})
-
-	return &schemas.Message{Message: "session deleted"}, nil
-}
-
-func (us *UserService) ListChannels(c *gin.Context) ([]schemas.Channel, *types.AppError) {
-	_, session := auth.GetUser(c)
-	client, _ := tgc.AuthClient(c, &us.cnf.TG, session)
-
-	channels := make(map[int64]*schemas.Channel)
-
-	client.Run(c, func(ctx context.Context) error {
-
-		dialogs, _ := query.GetDialogs(client.API()).BatchSize(100).Collect(ctx)
-
-		for _, dialog := range dialogs {
-			if !dialog.Deleted() {
-				for _, channel := range dialog.Entities.Channels() {
-					_, exists := channels[channel.ID]
-					if !exists && channel.AdminRights.AddAdmins {
-						channels[channel.ID] = &schemas.Channel{ChannelID: channel.ID, ChannelName: channel.Title}
-					}
-				}
-			}
-		}
-		return nil
-
-	})
-	res := []schemas.Channel{}
-
-	for _, channel := range channels {
-		res = append(res, *channel)
-
-	}
-
-	sort.Slice(res, func(i, j int) bool {
-		return res[i].ChannelName < res[j].ChannelName
-	})
-	return res, nil
-}
-
-func (us *UserService) AddBots(c *gin.Context) (*schemas.Message, *types.AppError) {
-	userId, session := auth.GetUser(c)
-	client, _ := tgc.AuthClient(c, &us.cnf.TG, session)
-
-	var botsTokens []string
-
-	if err := c.ShouldBindJSON(&botsTokens); err != nil {
-		return nil, &types.AppError{Error: err, Code: http.StatusBadRequest}
-	}
-
-	if len(botsTokens) == 0 {
-		return &schemas.Message{Message: "no bots to add"}, nil
-	}
-
-	channelId, err := getDefaultChannel(us.db, us.cache, userId)
-
-	if err != nil {
-		return nil, &types.AppError{Error: err, Code: http.StatusInternalServerError}
-	}
-
-	return us.addBots(c, client, userId, channelId, botsTokens)
-
-}
-
-func (us *UserService) RemoveBots(c *gin.Context) (*schemas.Message, *types.AppError) {
-
-	userID, _ := auth.GetUser(c)
-
-	channelId, err := getDefaultChannel(us.db, us.cache, userID)
-
-	if err != nil {
-		return nil, &types.AppError{Error: err, Code: http.StatusInternalServerError}
-	}
-
-	if err := us.db.Where("user_id = ?", userID).Where("channel_id = ?", channelId).
-		Delete(&models.Bot{}).Error; err != nil {
-		return nil, &types.AppError{Error: err, Code: http.StatusInternalServerError}
-	}
-
-	us.cache.Delete(fmt.Sprintf("users:bots:%d:%d", userID, channelId))
-
-	return &schemas.Message{Message: "bots deleted"}, nil
-
-}
-
-func (us *UserService) addBots(c context.Context, client *telegram.Client, userId int64, channelId int64, botsTokens []string) (*schemas.Message, *types.AppError) {
+func (a *apiService) addBots(c context.Context, client *telegram.Client, userId int64, channelId int64, botsTokens []string) error {
 
 	botInfoMap := make(map[string]*types.BotInfo)
 
@@ -308,7 +309,7 @@ func (us *UserService) addBots(c context.Context, client *telegram.Client, userI
 
 		for _, token := range botsTokens {
 			g.Go(func() error {
-				info, err := tgc.GetBotInfo(c, us.kv, &us.cnf.TG, token)
+				info, err := tgc.GetBotInfo(c, a.tgdb, &a.cnf.TG, token)
 				if err != nil {
 					return err
 				}
@@ -363,23 +364,22 @@ func (us *UserService) addBots(c context.Context, client *telegram.Client, userI
 	})
 
 	if err != nil {
-		return nil, &types.AppError{Error: err, Code: http.StatusInternalServerError}
+		return err
 	}
 
 	payload := []models.Bot{}
 
 	for _, info := range botInfoMap {
-		payload = append(payload, models.Bot{UserID: userId, Token: info.Token, BotID: info.Id,
-			BotUserName: info.UserName, ChannelID: channelId,
+		payload = append(payload, models.Bot{UserId: userId, Token: info.Token, BotId: info.Id,
+			BotUserName: info.UserName, ChannelId: channelId,
 		})
 	}
 
-	us.cache.Delete(fmt.Sprintf("users:bots:%d:%d", userId, channelId))
+	a.cache.Delete(cache.Key("users", "bots", userId, channelId))
 
-	if err := us.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&payload).Error; err != nil {
-		return nil, &types.AppError{Error: err, Code: http.StatusInternalServerError}
+	if err := a.db.Clauses(clause.OnConflict{DoNothing: true}).Create(&payload).Error; err != nil {
+		return err
 	}
-
-	return &schemas.Message{Message: "bots added"}, nil
+	return nil
 
 }
