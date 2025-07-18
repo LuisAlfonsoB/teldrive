@@ -1,0 +1,15 @@
+services:
+  teldrive:
+    image: ghcr.io/tgdrive/teldrive
+    restart: always
+    container_name: teldrive
+    networks:
+     - postgres
+    volumes:
+      - ./config.toml:/config.toml
+      - ./storage.db:/storage.db
+    ports:
+      - 8080:8080
+networks:
+  postgres:                                 
+    external: true
