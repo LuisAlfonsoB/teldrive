@@ -1,3 +1,17 @@
+[db]
+data-source = "postgresql://postgres.ciajqubyiqsssxocyhqk:teldrive@aws-0-us-east-2.pooler.supabase.com:6543/postgres"
+prepare-stmt = false
+
+[db.pool]
+enable = false
+
+[jwt]
+allowed-users = ["LABB96"]
+secret = "0e8c0c0836f5a8ed6979382297c67656"
+
+[tg.uploads]
+encryption-key = "f1PhSew6TIilqRVSyZjRMLFgKz6JdGC_"
+
 [cache]
 max-size = 10485760
 redis-addr = ''
@@ -8,21 +22,6 @@ clean-files-interval = '1h'
 clean-uploads-interval = '12h'
 enable = true
 folder-size-interval = '2h'
-
-[db]
-log-level = 'info'
-prepare-stmt = true
-
-[db.pool]
-enable = true
-max-idle-connections = 25
-max-lifetime = '10m'
-max-open-connections = 25
-
-[jwt]
-session-time = '30d'
-secret = ''
-allowed-users = []
 
 [log]
 level = 'info'
