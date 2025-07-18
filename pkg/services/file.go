@@ -273,10 +273,11 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 
 	}
 
-	if fileIn.Type == "folder" {
+	switch fileIn.Type {
+	case "folder":
 		fileDB.MimeType = "drive/folder"
 		fileDB.Parts = nil
-	} else if fileIn.Type == "file" {
+	case "file":
 		if fileIn.ChannelId.Value == 0 {
 			channelId, err = getDefaultChannel(a.db, a.cache, userId)
 			if err != nil {
@@ -297,7 +298,7 @@ func (a *apiService) FilesCreate(ctx context.Context, fileIn *api.File) (*api.Fi
 	fileDB.Type = string(fileIn.Type)
 	fileDB.UserId = userId
 	fileDB.Status = "active"
-	fileDB.Encrypted = fileIn.Encrypted.Value
+	fileDB.Encrypted = utils.Ptr(fileIn.Encrypted.Value)
 	if fileIn.UpdatedAt.IsSet() && !fileIn.UpdatedAt.Value.IsZero() {
 		fileDB.UpdatedAt = fileIn.UpdatedAt.Value
 	} else {
@@ -642,6 +643,7 @@ func (a *apiService) FilesUpdateParts(ctx context.Context, req *api.FilePartsUpd
 	}
 
 	updatePayload.UpdatedAt = req.UpdatedAt
+	updatePayload.Encrypted = utils.Ptr(req.Encrypted.Value)
 
 	err := a.db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Where("id = ?", params.ID).First(&file).Error; err != nil {
